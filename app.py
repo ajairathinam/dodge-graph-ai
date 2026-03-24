@@ -868,7 +868,7 @@ def _detect_query_intent(question: str, data_store: DataStore) -> dict[str, Any]
     
     Returns:
         {
-            "intent": "flow" | "analytical" | "metadata" | "incomplete_flows" | "unknown",
+            "intent": "flow" | "analytical" | "metadata" | "incomplete_flows" | "product_trace" | "top_products" | "unknown",
             "keywords": list[str],
             "analysis": str
         }
@@ -883,12 +883,21 @@ def _detect_query_intent(question: str, data_store: DataStore) -> dict[str, Any]
     ]):
         return {"intent": "incomplete_flows", "analysis": "Finding incomplete flows"}
     
+    # KEY-TERM MAPPING: PRODUCT TRACE QUERIES
+    if any(x in q for x in ["trace", "track", "find", "show"]) and any(x in q for x in ["product", "material"]):
+        return {"intent": "product_trace", "analysis": "Tracing product through order-to-cash flow"}
+    
     # KEY-TERM MAPPING: FLOW QUERIES
     if any(x in q for x in [
-        "flow", "path", "route", "trace", "journey", "trace order",
+        "flow", "path", "route", "journey", "trace order",
         "show me the", "what is the journey"
     ]):
-        return {"intent": "flow", "analysis": "Tracing process flow"}
+        if not any(x in q for x in ["product", "material"]):
+            return {"intent": "flow", "analysis": "Tracing process flow"}
+    
+    # KEY-TERM MAPPING: TOP PRODUCTS QUERIES
+    if any(x in q for x in ["top", "best", "highest", "ranking"]) and any(x in q for x in ["product", "material"]):
+        return {"intent": "top_products", "analysis": "Finding top products by metric"}
     
     # KEY-TERM MAPPING: PRODUCT BILLING DOCUMENT COUNT QUERY
     if any(x in q for x in ["highest number", "number of billing", "how many billing documents", "product billing document count"]):
@@ -921,6 +930,7 @@ def _detect_query_intent(question: str, data_store: DataStore) -> dict[str, Any]
     
     # DEFAULT - Unknown intent
     return {"intent": "unknown", "analysis": "Could not determine intent"}
+
 
 
 def _execute_pandas_query(
@@ -1102,6 +1112,290 @@ def _find_incomplete_flows_answer(data_store: DataStore) -> str:
         return f"Error analyzing incomplete flows: {str(e)}"
 
 
+def _extract_product_id(question: str) -> str | None:
+    """
+    Extract product/material ID or name from user question.
+    
+    Returns:
+        Extracted product ID/name, or None if not found
+    """
+    import re
+    
+    q = (question or "")
+    q_lower = q.lower()
+    
+    # Common words to exclude to avoid false positives
+    common_words = {
+        'here', 'this', 'that', 'what', 'which', 'when', 'where', 'how', 'why',
+        'the', 'from', 'for', 'with', 'about', 'an', 'as', 'is', 'are', 'was',
+        'and', 'but', 'or', 'if', 'all', 'each', 'every', 'both', 'any', 'some'
+    }
+    
+    # Pattern 1: Explicit "product X" or "material X" with alphanumeric ID/name
+    patterns = [
+        (r"(?:product|material|item|sku)\s+([A-Za-z0-9\-_\.]+)", True),
+        (r"trace\s+(?:product|material)\s+([A-Za-z0-9\-_\.]+)", True),
+    ]
+    
+    for pattern, preserve_case in patterns:
+        m = re.search(pattern, q, flags=re.IGNORECASE)
+        if m:
+            match = m.group(1).strip()
+            # Avoid common words
+            if match.lower() not in common_words:
+                return match if preserve_case else match.lower()
+    
+    # Pattern 2: Product name in quotes
+    m = re.search(r"(?:product|material).*['\"](.+?)['\"]", q, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    
+    # Pattern 3: Format: "CODE" at end of "product CODE"
+    m = re.search(r"(?:product|material)\s+([A-Z][A-Z0-9\-_]*[A-Z0-9])(?:\s|$)", q)
+    if m:
+        return m.group(1).strip()
+    
+    return None
+
+
+def _trace_product(
+    g: nx.DiGraph,
+    data_store: DataStore,
+    product_id: str
+) -> dict[str, Any]:
+    """
+    Trace a specific product through the order-to-cash flow.
+    
+    Returns all orders, deliveries, and billings that include this product.
+    """
+    product_normalized = str(product_id).strip()
+    
+    # Find all BillingItem nodes that contain this product
+    billing_items = []
+    for node_id, attrs in g.nodes(data=True):
+        if attrs.get("node_type") != "BillingItem":
+            continue
+        
+        material = attrs.get("material")
+        if material is None:
+            continue
+        
+        material_str = str(material).strip()
+        # Match either exact or contains
+        if (material_str.lower() == product_normalized.lower() or 
+            product_normalized.lower() in material_str.lower() or
+            material_str.lower() in product_normalized.lower()):
+            billing_items.append({
+                "node_id": node_id,
+                "billing_doc": attrs.get("billingDocument"),
+                "billing_item": attrs.get("billingDocumentItem"),
+                "quantity": attrs.get("billingQuantity"),
+                "amount": attrs.get("netAmount"),
+                "currency": attrs.get("transactionCurrency"),
+                "material": material_str
+            })
+    
+    if not billing_items:
+        return {
+            "product_id": product_id,
+            "found": False,
+            "message": f"Product '{product_id}' not found in billing items"
+        }
+    
+    # Trace back: find orders, deliveries, and billings
+    documents = {
+        "orders": set(),
+        "deliveries": set(),
+        "billings": set(),
+        "items": billing_items
+    }
+    
+    for item in billing_items:
+        billing_doc = item["billing_doc"]
+        
+        # Find the billing header node
+        for node_id, attrs in g.nodes(data=True):
+            if attrs.get("node_type") != "Billing":
+                continue
+            if attrs.get("billingDocument") == billing_doc:
+                # Found billing header, now trace back
+                documents["billings"].add(billing_doc)
+                
+                # Find predecessors (deliveries)
+                for pred in g.predecessors(node_id):
+                    pred_attrs = g.nodes[pred]
+                    if pred_attrs.get("node_type") == "Delivery":
+                        delivery_id = pred_attrs.get("deliveryDocument")
+                        if delivery_id:
+                            documents["deliveries"].add(delivery_id)
+                        
+                        # Find predecessors of delivery (orders)
+                        for pred2 in g.predecessors(pred):
+                            pred2_attrs = g.nodes[pred2]
+                            if pred2_attrs.get("node_type") == "Order":
+                                order_id = pred2_attrs.get("salesOrder")
+                                if order_id:
+                                    documents["orders"].add(order_id)
+                break
+    
+    # Convert sets to sorted lists
+    documents["orders"] = sorted(list(documents["orders"]))
+    documents["deliveries"] = sorted(list(documents["deliveries"]))
+    documents["billings"] = sorted(list(documents["billings"]))
+    
+    # Calculate totals
+    total_quantity = sum(float(item["quantity"] or 0) for item in documents["items"] if item["quantity"])
+    total_amount = sum(float(item["amount"] or 0) for item in documents["items"] if item["amount"])
+    
+    return {
+        "product_id": product_id,
+        "found": True,
+        "orders": documents["orders"],
+        "order_count": len(documents["orders"]),
+        "deliveries": documents["deliveries"],
+        "delivery_count": len(documents["deliveries"]),
+        "billings": documents["billings"],
+        "billing_count": len(documents["billings"]),
+        "total_items": len(documents["items"]),
+        "total_quantity": total_quantity,
+        "total_amount": total_amount,
+        "currency": documents["items"][0]["currency"] if documents["items"] else "N/A",
+        "items_sample": documents["items"][:3]  # Show first 3 items
+    }
+
+
+def _get_top_products(
+    g: nx.DiGraph,
+    data_store: DataStore,
+    metric: str = "quantity",
+    top_n: int = 10
+) -> dict[str, Any]:
+    """
+    Get top products by various metrics.
+    
+    Metrics:
+      - "quantity": Total billing quantity
+      - "revenue": Total net amount
+      - "frequency": Number of times billed
+      - "orders": Number of unique orders
+    """
+    products = {}
+    
+    # Collect product data
+    for node_id, attrs in g.nodes(data=True):
+        if attrs.get("node_type") != "BillingItem":
+            continue
+        
+        material = attrs.get("material")
+        if material is None:
+            continue
+        
+        material_str = str(material).strip()
+        if material_str not in products:
+            products[material_str] = {
+                "material": material_str,
+                "quantity": 0,
+                "revenue": 0,
+                "frequency": 0,
+                "orders": set(),
+                "billings": set()
+            }
+        
+        qty = float(attrs.get("billingQuantity") or 0)
+        amount = float(attrs.get("netAmount") or 0)
+        
+        products[material_str]["quantity"] += qty
+        products[material_str]["revenue"] += amount
+        products[material_str]["frequency"] += 1
+        
+        # Track unique billings
+        billing_doc = attrs.get("billingDocument")
+        if billing_doc:
+            products[material_str]["billings"].add(str(billing_doc))
+            
+            # Find orders for this product
+            for node_id2, attrs2 in g.nodes(data=True):
+                if attrs2.get("node_type") != "Billing":
+                    continue
+                if attrs2.get("billingDocument") == billing_doc:
+                    for pred in g.predecessors(node_id2):
+                        pred_attrs = g.nodes[pred]
+                        if pred_attrs.get("node_type") == "Delivery":
+                            for pred2 in g.predecessors(pred):
+                                pred2_attrs = g.nodes[pred2]
+                                if pred2_attrs.get("node_type") == "Order":
+                                    order_id = pred2_attrs.get("salesOrder")
+                                    if order_id:
+                                        products[material_str]["orders"].add(str(order_id))
+    
+    # Sort by metric
+    if metric == "quantity":
+        sorted_products = sorted(products.items(), key=lambda x: x[1]["quantity"], reverse=True)
+    elif metric == "revenue":
+        sorted_products = sorted(products.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    elif metric == "frequency":
+        sorted_products = sorted(products.items(), key=lambda x: x[1]["frequency"], reverse=True)
+    elif metric == "orders":
+        sorted_products = sorted(products.items(), key=lambda x: len(x[1]["orders"]), reverse=True)
+    else:
+        sorted_products = sorted(products.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    
+    # Format results
+    results = []
+    for material, data in sorted_products[:top_n]:
+        results.append({
+            "material": material,
+            "total_quantity": data["quantity"],
+            "total_revenue": data["revenue"],
+            "billing_frequency": data["frequency"],
+            "unique_orders": len(data["orders"]),
+            "unique_billings": len(data["billings"])
+        })
+    
+    return {
+        "metric": metric,
+        "top_n": top_n,
+        "results": results,
+        "total_unique_products": len(products)
+    }
+
+
+def _clarify_ambiguous_question(question: str) -> str:
+    """
+    Generate a clarification message when a question is too vague.
+    
+    Suggests what information is needed.
+    """
+    q = (question or "").lower()
+    
+    clarifications = []
+    
+    if not q or len(q) < 3:
+        return "Your question is too short. Please provide more details. Example: 'Trace product X100' or 'Show top products by revenue'"
+    
+    if any(x in q for x in ["trace", "find", "show", "where"]):
+        if not any(x in q for x in ["product", "material", "order", "delivery", "id", "number"]):
+            clarifications.append("Please specify what you want to trace: a product/material ID, order number, or delivery ID?")
+            clarifications.append("Examples: 'Trace product X100', 'Trace order 740509'")
+    
+    if any(x in q for x in ["top", "best", "highest", "most", "ranking"]):
+        if not any(x in q for x in ["product", "material", "customer", "order"]):
+            clarifications.append("Please clarify what 'top' means: top products? top orders? top customers?")
+            clarifications.append("Examples: 'Top 5 products by revenue', 'Top orders by value'")
+        elif not any(x in q for x in ["quantity", "revenue", "amount", "frequency", "value", "count", "sales"]):
+            clarifications.append("Please specify the metric: by quantity, revenue, frequency, or number of orders?")
+            clarifications.append("Examples: 'Top 10 products by revenue', 'Top 5 products by quantity'")
+    
+    if any(x in q for x in ["product", "material"]):
+        if not any(x in q for x in ["trace", "top", "best", "how much", "quantity", "revenue"]):
+            clarifications.append("For product queries, you can: trace a specific product, view top products, or analyze metrics.")
+            clarifications.append("Examples: 'Trace product M001', 'Show top 10 products by revenue'")
+    
+    if clarifications:
+        return "\n".join(clarifications)
+    
+    return None
+
 
 @app.post("/chat")
 def chat():
@@ -1208,6 +1502,96 @@ def chat():
             reply += f"\nTotal Products in Dataset: {result['total_products']}"
             return jsonify({"reply": reply})
         
+        elif intent == "product_trace":
+            product_id = _extract_product_id(question)
+            
+            if product_id is None:
+                clarification = _clarify_ambiguous_question(question)
+                if clarification:
+                    return jsonify({"reply": clarification})
+                return jsonify({"reply": "Please provide a product ID or material name to trace. Example: 'Trace product M001'"})
+            
+            trace_result = _trace_product(g, data_store, product_id)
+            
+            if not trace_result.get("found"):
+                return jsonify({"reply": trace_result.get("message", f"Product '{product_id}' not found in dataset")})
+            
+            # Format the response
+            reply = f"📊 PRODUCT TRACE: {trace_result['product_id']}\n\n"
+            reply += f"✓ Found in {trace_result['total_items']} billing line item(s)\n\n"
+            
+            reply += f"🔗 Order-to-Cash Flow:\n"
+            reply += f"  • Sales Orders: {trace_result['order_count']} → {', '.join(trace_result['orders'][:3])}"
+            if trace_result['order_count'] > 3:
+                reply += f" (+{trace_result['order_count']-3} more)"
+            reply += f"\n  • Deliveries: {trace_result['delivery_count']} → {', '.join(trace_result['deliveries'][:3])}"
+            if trace_result['delivery_count'] > 3:
+                reply += f" (+{trace_result['delivery_count']-3} more)"
+            reply += f"\n  • Billings: {trace_result['billing_count']} → {', '.join(trace_result['billings'][:3])}"
+            if trace_result['billing_count'] > 3:
+                reply += f" (+{trace_result['billing_count']-3} more)"
+            reply += "\n\n"
+            
+            reply += f"📈 Summary:\n"
+            reply += f"  • Total Quantity: {trace_result['total_quantity']}\n"
+            reply += f"  • Total Amount: {trace_result['total_amount']} {trace_result['currency']}\n"
+            
+            return jsonify({"reply": reply})
+        
+        elif intent == "top_products":
+            # Extract metric from question
+            metric = "revenue"  # default
+            top_n = 10  # default
+            
+            if any(x in q for x in ["quantity", "qty", "units", "how many"]):
+                metric = "quantity"
+            elif any(x in q for x in ["frequency", "times", "often"]):
+                metric = "frequency"
+            elif any(x in q for x in ["order", "orders"]):
+                metric = "orders"
+            
+            # Extract top_n if specified
+            import re
+            m = re.search(r"top\s+(\d+)", q, flags=re.IGNORECASE)
+            if m:
+                top_n = int(m.group(1))
+            
+            result = _get_top_products(g, data_store, metric=metric, top_n=top_n)
+            
+            if not result["results"]:
+                return jsonify({"reply": "No product data found in dataset."})
+            
+            # Format the response
+            metric_display = {
+                "quantity": "Total Quantity",
+                "revenue": "Total Revenue",
+                "frequency": "Billing Frequency",
+                "orders": "Unique Orders"
+            }.get(metric, metric)
+            
+            reply = f"📊 TOP {result['top_n']} PRODUCTS BY {metric_display.upper()}\n\n"
+            
+            for i, product in enumerate(result["results"], 1):
+                reply += f"{i}. {product['material']}\n"
+                
+                if metric == "revenue":
+                    reply += f"   💰 Revenue: {product['total_revenue']}\n"
+                    reply += f"   📦 Quantity: {product['total_quantity']}\n"
+                elif metric == "quantity":
+                    reply += f"   📦 Quantity: {product['total_quantity']}\n"
+                    reply += f"   💰 Revenue: {product['total_revenue']}\n"
+                elif metric == "frequency":
+                    reply += f"   🔄 Frequency: {product['billing_frequency']} billings\n"
+                    reply += f"   📦 Quantity: {product['total_quantity']}\n"
+                elif metric == "orders":
+                    reply += f"   🛒 Orders: {product['unique_orders']}\n"
+                    reply += f"   💰 Revenue: {product['total_revenue']}\n"
+                
+                reply += f"   📋 Billings: {product['unique_billings']}\n\n"
+            
+            reply += f"Total unique products in dataset: {result['total_unique_products']}"
+            return jsonify({"reply": reply})
+        
         elif intent == "analytical":
             reply = _execute_pandas_query(data_store, question, model)
             return jsonify({"reply": reply})
@@ -1236,9 +1620,24 @@ def chat():
                 reply = f"Top billed product: {best['material']} (Total: {best['totalNetAmount']} {best['transactionCurrency']})"
                 return jsonify({"reply": reply})
             
+            # Check if it's an ambiguous question and provide clarification
+            clarification = _clarify_ambiguous_question(question)
+            if clarification:
+                return jsonify({"reply": clarification})
+            
             return jsonify({
-                "reply": "I can help with: (1) flow queries, (2) analytical queries, (3) incomplete flows, (4) statistics."
+                "reply": "I can help with:\n"
+                "(1) Order tracing - 'Trace order 740509'\n"
+                "(2) Product tracing - 'Trace product M001'\n"
+                "(3) Top products - 'Show top 10 products by revenue'\n"
+                "(4) Analytical queries - 'Monthly sales'\n"
+                "(5) Incomplete flows - 'Show incomplete flows'\n"
+                "(6) Dataset statistics - 'How many orders?'"
             })
+
+    except Exception as e:
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
 
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500

@@ -5,5 +5,4 @@ venv/
 .venv/
 .venv-1/
 .venv-2/
-dataset/
 .vscode/
