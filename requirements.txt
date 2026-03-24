@@ -1,0 +1,6 @@
+flask
+pandas
+networkx
+python-dotenv
+gunicorn
+google-generativeai
